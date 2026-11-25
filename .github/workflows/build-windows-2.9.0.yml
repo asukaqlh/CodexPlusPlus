@@ -1,0 +1,114 @@
+name: Build Windows installer 2.9.0
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Build Windows x64 installer
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Set and verify version 2.9.0
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+          import path from 'node:path';
+          import { VERSION_FILES, root } from './scripts/release-meta.mjs';
+          for (const { file, read, bump } of VERSION_FILES) {
+            const filePath = path.join(root, file);
+            const before = readFileSync(filePath, 'utf8').split(String.fromCharCode(13)).join('');
+            const from = read(before);
+            if (from !== '2.8.0') throw new Error('Unexpected source version: ' + file + ': ' + from);
+            const after = bump(before, from, '2.9.0');
+            if (read(after) !== '2.9.0') throw new Error('Version update failed: ' + file);
+            writeFileSync(filePath, after);
+          }
+          NODE
+          node scripts/release-meta.mjs check 2.9.0
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          $makensis = $null
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            choco install nsis -y --no-progress
+            $candidates = @(
+              (Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'NSIS\makensis.exe'),
+              (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'NSIS\makensis.exe')
+            )
+            $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+            if (-not $makensis) {
+              $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
+              if ($command) { $makensis = $command.Source }
+            }
+            if ($makensis) {
+              & $makensis /VERSION
+              if ($LASTEXITCODE -eq 0) { break }
+            }
+            $makensis = $null
+            if ($attempt -lt 3) { Start-Sleep -Seconds (10 * $attempt) }
+          }
+          if (-not $makensis) { throw 'NSIS compiler is unavailable.' }
+
+      - name: Install frontend dependencies
+        working-directory: apps/codex-plus-manager
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: apps/codex-plus-manager
+        run: npm run vite:build
+
+      - name: Build application
+        run: cargo build --release
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/windows/app | Out-Null
+          Copy-Item target/release/codex-plus-plus.exe dist/windows/app/
+          $candidates = @(
+            (Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'NSIS\makensis.exe'),
+            (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'NSIS\makensis.exe')
+          )
+          $makensis = $candidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $makensis) {
+            $command = Get-Command makensis.exe -ErrorAction SilentlyContinue
+            if ($command) { $makensis = $command.Source }
+          }
+          if (-not $makensis) { throw 'NSIS compiler is unavailable.' }
+          Push-Location scripts/installer/windows
+          try {
+            & $makensis '/INPUTCHARSET' 'UTF8' '/DVERSION=2.9.0' '/DVI_VERSION=2.9.0.0' CodexPlusPlus.nsi
+            if ($LASTEXITCODE -ne 0) { throw 'NSIS packaging failed.' }
+          } finally {
+            Pop-Location
+          }
+          $installer = Get-Item dist/windows/CodexPlusPlus-2.9.0-windows-x64-setup.exe
+          if ($installer.Length -eq 0 -or $installer.VersionInfo.ProductVersion -ne '2.9.0') {
+            throw 'Installer is empty or has the wrong version.'
+          }
+          $hash = (Get-FileHash -Algorithm SHA256 $installer.FullName).Hash.ToLowerInvariant()
+          Set-Content -Encoding ascii dist/windows/SHA256SUMS.txt "$hash  $($installer.Name)"
+
+      - name: Upload installer and checksum
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodexPlusPlus-2.9.0-windows-x64-setup
+          path: |
+            dist/windows/CodexPlusPlus-2.9.0-windows-x64-setup.exe
+            dist/windows/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 90
